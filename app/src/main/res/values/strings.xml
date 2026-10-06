@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TapRec</string>
+    <string name="svc_desc">录制并回放点击、滑动操作</string>
+</resources>
