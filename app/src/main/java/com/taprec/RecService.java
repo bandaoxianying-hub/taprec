@@ -51,7 +51,8 @@ public class RecService extends AccessibilityService {
     private View captureView;
     private WindowManager.LayoutParams captureLp;
 
-    private boolean fastMode = true;
+    // 0 = 快速  1 = 快速+左侧精确  2 = 快速+右侧精确  3 = 精确
+    private int mode = 0;
     private boolean recording = false;
     private boolean playing = false;
     private int playToken = 0;
@@ -74,6 +75,11 @@ public class RecService extends AccessibilityService {
     private int lastSx;
     private int lastSy;
     private int lastFrom;
+    // 精确区域内最近一次触摸（用来和系统事件去重）
+    private long lastPreciseTime = 0;
+    private long lastPreciseSwipeTime = 0;
+    private float lastPreciseX;
+    private float lastPreciseY;
     // 快速模式：去重
     private long lastTapTime = 0;
     private float lastTapX;
@@ -84,7 +90,8 @@ public class RecService extends AccessibilityService {
         super.onServiceConnected();
         instance = this;
         wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
-        fastMode = getSharedPreferences("taprec", MODE_PRIVATE).getBoolean("fast", true);
+        android.content.SharedPreferences sp = getSharedPreferences("taprec", MODE_PRIVATE);
+        mode = sp.getInt("mode", sp.getBoolean("fast", true) ? 0 : 3);
         if (captureView == null) createCapture();
         showPanel();
     }
@@ -93,7 +100,7 @@ public class RecService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (!recording || !fastMode || event == null) return;
+        if (!recording || !eventsOn() || event == null) return;
         CharSequence pkg = event.getPackageName();
         if (pkg != null && getPackageName().contentEquals(pkg)) return;
         int type = event.getEventType();
@@ -106,6 +113,11 @@ public class RecService extends AccessibilityService {
             Rect r = new Rect();
             src.getBoundsInScreen(r);
             if (r.width() <= 0 || r.height() <= 0) return;
+            if (captureOn() && SystemClock.uptimeMillis() - lastPreciseTime < 800) {
+                Rect big = new Rect(r);
+                big.inset(-24, -24);
+                if (big.contains((int) lastPreciseX, (int) lastPreciseY)) return;
+            }
             flushScroll();
             addFastTouch(r.exactCenterX(), r.exactCenterY(),
                     type == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED ? 700 : 60);
@@ -131,6 +143,7 @@ public class RecService extends AccessibilityService {
     }
 
     private void onScrollEvent(AccessibilityEvent e) {
+        if (captureOn() && SystemClock.uptimeMillis() - lastPreciseSwipeTime < 1200) return;
         AccessibilityNodeInfo src = e.getSource();
         if (src == null) return;
         Rect r = new Rect();
@@ -268,8 +281,19 @@ public class RecService extends AccessibilityService {
         return t;
     }
 
+    private boolean eventsOn() {
+        return mode != 3;
+    }
+
+    private boolean captureOn() {
+        return mode != 0;
+    }
+
     private String modeText() {
-        return fastMode ? "模式：快速" : "模式：精确";
+        if (mode == 1) return "模式：快速+左侧精确";
+        if (mode == 2) return "模式：快速+右侧精确";
+        if (mode == 3) return "模式：精确";
+        return "模式：快速";
     }
 
     public void showPanel() {
@@ -300,8 +324,8 @@ public class RecService extends AccessibilityService {
                 setStatus("请先点停止");
                 return;
             }
-            fastMode = !fastMode;
-            getSharedPreferences("taprec", MODE_PRIVATE).edit().putBoolean("fast", fastMode).apply();
+            mode = (mode + 1) % 4;
+            getSharedPreferences("taprec", MODE_PRIVATE).edit().putInt("mode", mode).apply();
             modeBtn.setText(modeText());
         });
         box.addView(modeBtn);
@@ -356,6 +380,13 @@ public class RecService extends AccessibilityService {
                 | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
         if (!touchable) flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
         captureLp.flags = flags;
+        if (mode == 1 || mode == 2) {
+            captureLp.width = getResources().getDisplayMetrics().widthPixels * 3 / 10;
+            captureLp.gravity = (mode == 2 ? Gravity.END : Gravity.START) | Gravity.TOP;
+        } else {
+            captureLp.width = WindowManager.LayoutParams.MATCH_PARENT;
+            captureLp.gravity = Gravity.START | Gravity.TOP;
+        }
         captureView.setBackgroundColor(recording ? 0x22FF0000 : 0x00000000);
         try {
             wm.updateViewLayout(captureView, captureLp);
@@ -386,8 +417,18 @@ public class RecService extends AccessibilityService {
                     Gesture g = drag;
                     drag = null;
                     g.pts.add(new float[]{x, y});
-                    g.dur = Math.max(50, e.getEventTime() - dragStart);
+                    long held = Math.max(50, e.getEventTime() - dragStart);
+                    boolean moved = false;
+                    float[] p0 = g.pts.get(0);
+                    for (float[] q : g.pts) {
+                        if (Math.hypot(q[0] - p0[0], q[1] - p0[1]) > 24) moved = true;
+                    }
+                    g.dur = moved ? Math.min(held, 400) : Math.min(held, 1200);
                     lastEnd = e.getEventTime();
+                    lastPreciseTime = SystemClock.uptimeMillis();
+                    lastPreciseX = x;
+                    lastPreciseY = y;
+                    if (moved) lastPreciseSwipeTime = lastPreciseTime;
                     thin(g);
                     current.add(g);
                     setStatus("录制中：" + current.size() + " 个动作");
@@ -418,7 +459,7 @@ public class RecService extends AccessibilityService {
     private void passThrough(Gesture g) {
         setCapture(false);
         dispatch(g, () -> {
-            if (recording && !fastMode) setCapture(true);
+            if (recording && captureOn()) setCapture(true);
         });
     }
 
@@ -432,8 +473,10 @@ public class RecService extends AccessibilityService {
         lastTapTime = 0;
         drag = null;
         scrollPending = false;
-        setStatus(fastMode ? "录制中（快速）" : "录制中（精确）");
-        if (!fastMode) setCapture(true);
+        lastPreciseTime = 0;
+        lastPreciseSwipeTime = 0;
+        setStatus("录制中（" + modeText().substring(3) + "）");
+        if (captureOn()) setCapture(true);
     }
 
     private void stopRecording() {
@@ -441,7 +484,7 @@ public class RecService extends AccessibilityService {
         recording = false;
         setCapture(false);
         if (current.isEmpty()) {
-            setStatus(fastMode ? "没录到动作，可切到精确模式再试" : "没录到动作");
+            setStatus(mode == 0 ? "没录到动作，可换一种模式再试" : "没录到动作");
             return;
         }
         save(current);
