@@ -7,13 +7,17 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -28,20 +32,26 @@ public class RecService extends AccessibilityService {
     public static RecService instance;
 
     private static class Gesture {
+        int kind;   // 0 = 触摸  1 = 返回  2 = 主页
         long wait;
         long dur;
         final List<float[]> pts = new ArrayList<>();
     }
 
+    private static final long SCROLL_GAP = 350;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Runnable flushRunnable = this::flushScroll;
     private WindowManager wm;
     private View panel;
     private WindowManager.LayoutParams panelLp;
     private TextView status;
     private TextView repeatBtn;
+    private TextView modeBtn;
     private View captureView;
     private WindowManager.LayoutParams captureLp;
 
+    private boolean fastMode = true;
     private boolean recording = false;
     private boolean playing = false;
     private int playToken = 0;
@@ -52,17 +62,152 @@ public class RecService extends AccessibilityService {
     private final int[] repeatOptions = {1, 3, 5, 10, 30};
     private int repeatIdx = 0;
 
+    // 快速模式：滚动合并
+    private boolean scrollPending = false;
+    private long scrollStart;
+    private long scrollLast;
+    private float scrollDx;
+    private float scrollDy;
+    private int scrollKey;
+    private final Rect scrollRect = new Rect();
+    private int lastKey;
+    private int lastSx;
+    private int lastSy;
+    private int lastFrom;
+    // 快速模式：去重
+    private long lastTapTime = 0;
+    private float lastTapX;
+    private float lastTapY;
+
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
         instance = this;
         wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
-        createCapture();
+        fastMode = getSharedPreferences("taprec", MODE_PRIVATE).getBoolean("fast", true);
+        if (captureView == null) createCapture();
         showPanel();
     }
 
+    // ---------- 快速模式：根据系统事件录制 ----------
+
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (!recording || !fastMode || event == null) return;
+        CharSequence pkg = event.getPackageName();
+        if (pkg != null && getPackageName().contentEquals(pkg)) return;
+        int type = event.getEventType();
+        if (type == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            onScrollEvent(event);
+        } else if (type == AccessibilityEvent.TYPE_VIEW_CLICKED
+                || type == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) {
+            AccessibilityNodeInfo src = event.getSource();
+            if (src == null) return;
+            Rect r = new Rect();
+            src.getBoundsInScreen(r);
+            if (r.width() <= 0 || r.height() <= 0) return;
+            flushScroll();
+            addFastTouch(r.exactCenterX(), r.exactCenterY(),
+                    type == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED ? 700 : 60);
+        }
+    }
+
+    private void addFastTouch(float x, float y, long dur) {
+        long now = SystemClock.uptimeMillis();
+        if (lastTapTime != 0 && now - lastTapTime < 250
+                && Math.abs(x - lastTapX) < 20 && Math.abs(y - lastTapY) < 20) {
+            return;
+        }
+        lastTapTime = now;
+        lastTapX = x;
+        lastTapY = y;
+        Gesture g = new Gesture();
+        g.dur = dur;
+        g.pts.add(new float[]{x, y});
+        g.wait = lastEnd == 0 ? 0 : Math.max(250, now - lastEnd);
+        lastEnd = now;
+        current.add(g);
+        setStatus("录制中：" + current.size() + " 个动作");
+    }
+
+    private void onScrollEvent(AccessibilityEvent e) {
+        AccessibilityNodeInfo src = e.getSource();
+        if (src == null) return;
+        Rect r = new Rect();
+        src.getBoundsInScreen(r);
+        if (r.width() < 100 || r.height() < 100) return;
+
+        float dx = 0;
+        float dy = 0;
+        if (Build.VERSION.SDK_INT >= 28) {
+            dx = e.getScrollDeltaX();
+            dy = e.getScrollDeltaY();
+        }
+        int key = r.left * 31 + r.top * 17 + r.right * 13 + r.bottom * 7;
+        if (dx == 0 && dy == 0 && key == lastKey) {
+            dx = e.getScrollX() - lastSx;
+            dy = e.getScrollY() - lastSy;
+            if (dx == 0 && dy == 0) {
+                float rows = Math.max(1, e.getToIndex() - e.getFromIndex() + 1);
+                dy = (e.getFromIndex() - lastFrom) * (r.height() / rows);
+            }
+        }
+        lastKey = key;
+        lastSx = e.getScrollX();
+        lastSy = e.getScrollY();
+        lastFrom = e.getFromIndex();
+        if (dx == 0 && dy == 0) return;
+
+        long now = SystemClock.uptimeMillis();
+        if (scrollPending && (now - scrollLast > SCROLL_GAP || key != scrollKey)) {
+            flushScroll();
+        }
+        if (!scrollPending) {
+            scrollPending = true;
+            scrollStart = now;
+            scrollDx = 0;
+            scrollDy = 0;
+            scrollKey = key;
+            scrollRect.set(r);
+        }
+        scrollDx += dx;
+        scrollDy += dy;
+        scrollLast = now;
+        handler.removeCallbacks(flushRunnable);
+        handler.postDelayed(flushRunnable, SCROLL_GAP);
+    }
+
+    private void flushScroll() {
+        handler.removeCallbacks(flushRunnable);
+        if (!scrollPending) return;
+        scrollPending = false;
+        float dx = scrollDx;
+        float dy = scrollDy;
+        if (Math.abs(dx) < 5 && Math.abs(dy) < 5) return;
+
+        float cx = scrollRect.exactCenterX();
+        float cy = scrollRect.exactCenterY();
+        float x1 = cx;
+        float y1 = cy;
+        float x2 = cx;
+        float y2 = cy;
+        if (Math.abs(dy) >= Math.abs(dx)) {
+            float half = Math.min(Math.max(Math.abs(dy), 150f), scrollRect.height() * 0.7f) / 2f;
+            y1 = cy + (dy > 0 ? half : -half);
+            y2 = cy + (dy > 0 ? -half : half);
+        } else {
+            float half = Math.min(Math.max(Math.abs(dx), 150f), scrollRect.width() * 0.7f) / 2f;
+            x1 = cx + (dx > 0 ? half : -half);
+            x2 = cx + (dx > 0 ? -half : half);
+        }
+        Gesture g = new Gesture();
+        g.dur = 300;
+        g.pts.add(new float[]{x1, y1});
+        g.pts.add(new float[]{x2, y2});
+        g.wait = lastEnd == 0 ? 0 : Math.max(250, scrollStart - lastEnd);
+        lastEnd = scrollLast;
+        current.add(g);
+        setStatus("录制中：" + current.size() + " 个动作");
     }
 
     @Override
@@ -123,6 +268,10 @@ public class RecService extends AccessibilityService {
         return t;
     }
 
+    private String modeText() {
+        return fastMode ? "模式：快速" : "模式：精确";
+    }
+
     public void showPanel() {
         if (panel != null || wm == null) return;
         LinearLayout box = new LinearLayout(this);
@@ -139,11 +288,23 @@ public class RecService extends AccessibilityService {
         box.addView(makeButton("● 录制", v -> startRecording()));
         box.addView(makeButton("■ 停止", v -> stopAll()));
         box.addView(makeButton("▶ 回放", v -> startPlaying()));
-        repeatBtn = makeButton("次数 ×1", v -> {
+        box.addView(makeButton("↩ 返回", v -> navKey(1)));
+        box.addView(makeButton("⌂ 主页", v -> navKey(2)));
+        repeatBtn = makeButton("次数 ×" + repeatOptions[repeatIdx], v -> {
             repeatIdx = (repeatIdx + 1) % repeatOptions.length;
             repeatBtn.setText("次数 ×" + repeatOptions[repeatIdx]);
         });
         box.addView(repeatBtn);
+        modeBtn = makeButton(modeText(), v -> {
+            if (recording || playing) {
+                setStatus("请先点停止");
+                return;
+            }
+            fastMode = !fastMode;
+            getSharedPreferences("taprec", MODE_PRIVATE).edit().putBoolean("fast", fastMode).apply();
+            modeBtn.setText(modeText());
+        });
+        box.addView(modeBtn);
         box.addView(makeButton("✕ 隐藏", v -> hidePanel()));
 
         panelLp = new WindowManager.LayoutParams(
@@ -171,7 +332,7 @@ public class RecService extends AccessibilityService {
         if (status != null) status.setText(s);
     }
 
-    // ---------- 全屏捕获层（录制时才可触摸） ----------
+    // ---------- 精确模式：全屏捕获层（录制时才可触摸） ----------
 
     private void createCapture() {
         captureView = new View(this);
@@ -257,7 +418,7 @@ public class RecService extends AccessibilityService {
     private void passThrough(Gesture g) {
         setCapture(false);
         dispatch(g, () -> {
-            if (recording) setCapture(true);
+            if (recording && !fastMode) setCapture(true);
         });
     }
 
@@ -268,14 +429,21 @@ public class RecService extends AccessibilityService {
         recording = true;
         current = new ArrayList<>();
         lastEnd = 0;
+        lastTapTime = 0;
         drag = null;
-        setStatus("录制中…");
-        setCapture(true);
+        scrollPending = false;
+        setStatus(fastMode ? "录制中（快速）" : "录制中（精确）");
+        if (!fastMode) setCapture(true);
     }
 
     private void stopRecording() {
+        flushScroll();
         recording = false;
         setCapture(false);
+        if (current.isEmpty()) {
+            setStatus(fastMode ? "没录到动作，可切到精确模式再试" : "没录到动作");
+            return;
+        }
         save(current);
         setStatus("已保存 " + current.size() + " 个动作");
     }
@@ -288,6 +456,21 @@ public class RecService extends AccessibilityService {
             playToken++;
             setStatus("已停止");
         }
+    }
+
+    // 面板上的“返回”“主页”：立即执行；录制中同时记下来
+    private void navKey(int kind) {
+        if (playing) return;
+        performGlobalAction(kind == 1 ? GLOBAL_ACTION_BACK : GLOBAL_ACTION_HOME);
+        if (!recording) return;
+        flushScroll();
+        long now = SystemClock.uptimeMillis();
+        Gesture g = new Gesture();
+        g.kind = kind;
+        g.wait = lastEnd == 0 ? 0 : Math.max(250, now - lastEnd);
+        lastEnd = now;
+        current.add(g);
+        setStatus("录制中：" + current.size() + " 个动作");
     }
 
     private void startPlaying() {
@@ -324,8 +507,20 @@ public class RecService extends AccessibilityService {
         long wait = idx == 0 ? 0 : g.wait;
         handler.postDelayed(() -> {
             if (!playing || token != playToken) return;
-            dispatch(g, () -> playRound(list, idx + 1, round, total, token));
+            runAction(g, () -> playRound(list, idx + 1, round, total, token));
         }, wait);
+    }
+
+    private void runAction(Gesture g, Runnable done) {
+        if (g.kind == 1) {
+            performGlobalAction(GLOBAL_ACTION_BACK);
+            handler.postDelayed(done, 400);
+        } else if (g.kind == 2) {
+            performGlobalAction(GLOBAL_ACTION_HOME);
+            handler.postDelayed(done, 600);
+        } else {
+            dispatch(g, done);
+        }
     }
 
     private void dispatch(Gesture g, Runnable done) {
@@ -371,6 +566,7 @@ public class RecService extends AccessibilityService {
             JSONArray arr = new JSONArray();
             for (Gesture g : list) {
                 JSONObject o = new JSONObject();
+                o.put("k", g.kind);
                 o.put("w", g.wait);
                 o.put("d", g.dur);
                 JSONArray pts = new JSONArray();
@@ -397,6 +593,7 @@ public class RecService extends AccessibilityService {
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.getJSONObject(i);
                 Gesture g = new Gesture();
+                g.kind = o.optInt("k", 0);
                 g.wait = o.getLong("w");
                 g.dur = o.getLong("d");
                 JSONArray pts = o.getJSONArray("p");
@@ -404,7 +601,7 @@ public class RecService extends AccessibilityService {
                     JSONArray a = pts.getJSONArray(j);
                     g.pts.add(new float[]{(float) a.getDouble(0), (float) a.getDouble(1)});
                 }
-                if (!g.pts.isEmpty()) list.add(g);
+                if (g.kind != 0 || !g.pts.isEmpty()) list.add(g);
             }
         } catch (Exception ignored) {
         }
