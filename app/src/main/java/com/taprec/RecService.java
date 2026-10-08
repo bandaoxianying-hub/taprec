@@ -117,7 +117,8 @@ public class RecService extends AccessibilityService {
         wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
         android.content.SharedPreferences sp = getSharedPreferences("taprec", MODE_PRIVATE);
         mode = 3;
-        captureInfo = "全屏精确录制（点击几乎没有延迟）";
+        captureInfo = "全屏精确录制（点击、拖动都实时转发）";
+        relayBroken = sp.getBoolean("relayBroken", false);
         if (captureView == null) createCapture();
         showPanel();
     }
@@ -683,50 +684,177 @@ public class RecService extends AccessibilityService {
         float y = e.getRawY();
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
+                if (relayStarted) break;
+                relayUp = false;
                 drag = new Gesture();
                 dragStart = e.getEventTime();
                 drag.wait = lastEnd == 0 ? 0 : Math.max(0, dragStart - lastEnd);
                 drag.pts.add(new float[]{x, y});
+                latestX = x;
+                latestY = y;
                 break;
             case MotionEvent.ACTION_MOVE:
                 if (drag != null) {
+                    latestX = x;
+                    latestY = y;
                     float[] last = drag.pts.get(drag.pts.size() - 1);
                     if (Math.hypot(x - last[0], y - last[1]) >= 12) {
                         drag.pts.add(new float[]{x, y});
+                    }
+                    if (relayStarted) {
+                        relayPump();
+                    } else if (!relayBroken) {
+                        float[] p0 = drag.pts.get(0);
+                        if (Math.hypot(x - p0[0], y - p0[1]) > dp(10)) startRelay(p0[0], p0[1]);
                     }
                 }
                 break;
             case MotionEvent.ACTION_UP:
                 if (drag != null) {
-                    Gesture g = drag;
-                    drag = null;
-                    g.pts.add(new float[]{x, y});
-                    long held = Math.max(50, e.getEventTime() - dragStart);
-                    boolean moved = false;
-                    float[] p0 = g.pts.get(0);
-                    for (float[] q : g.pts) {
-                        if (Math.hypot(q[0] - p0[0], q[1] - p0[1]) > 24) moved = true;
-                    }
-                    boolean tap = !moved && held < 350;
-                    g.dur = moved ? Math.min(held, 300) : (tap ? 60 : Math.min(held, 1200));
-                    lastEnd = e.getEventTime();
-                    lastPreciseTime = SystemClock.uptimeMillis();
-                    lastPreciseX = x;
-                    lastPreciseY = y;
-                    if (moved) lastPreciseSwipeTime = lastPreciseTime;
-                    thin(g);
-                    current.add(g);
-                    setStatus("录制中：" + current.size() + " 个动作");
-                    passThrough(g, tap);
+                    latestX = x;
+                    latestY = y;
+                    finishDrag(x, y, e.getEventTime());
                 }
                 break;
             case MotionEvent.ACTION_CANCEL:
+                if (drag != null && relayStarted && !relayUp) {
+                    if (SystemClock.uptimeMillis() - relayToggleTime < 400) {
+                        relayBroken = true;
+                        getSharedPreferences("taprec", MODE_PRIVATE).edit()
+                                .putBoolean("relayBroken", true).apply();
+                        setStatus("这台平板不能实时拖动，已改为抬手后转发");
+                    }
+                    finishDrag(latestX, latestY, e.getEventTime());
+                }
                 drag = null;
                 break;
             default:
                 break;
         }
         return true;
+    }
+
+    private void finishDrag(float x, float y, long eventTime) {
+        Gesture g = drag;
+        drag = null;
+        if (g == null) return;
+        g.pts.add(new float[]{x, y});
+        long held = Math.max(50, eventTime - dragStart);
+        boolean moved = false;
+        float[] p0 = g.pts.get(0);
+        for (float[] q : g.pts) {
+            if (Math.hypot(q[0] - p0[0], q[1] - p0[1]) > 24) moved = true;
+        }
+        boolean tap = !moved && held < 350;
+        g.dur = moved ? Math.min(held, 500) : (tap ? 60 : Math.min(held, 1200));
+        lastEnd = eventTime;
+        lastPreciseTime = SystemClock.uptimeMillis();
+        lastPreciseX = x;
+        lastPreciseY = y;
+        if (moved) lastPreciseSwipeTime = lastPreciseTime;
+        thin(g);
+        current.add(g);
+        setStatus("录制中：" + current.size() + " 个动作");
+        if (relayStarted) {
+            relayUp = true;
+            relayPump();
+        } else {
+            passThrough(g, tap);
+        }
+    }
+
+    // ---------- 拖动实时转发：边拖边把手指的位置送给下面的应用 ----------
+
+    private boolean relayBroken = false;
+    private boolean relayStarted = false;
+    private boolean relayBusy = false;
+    private boolean relayUp = false;
+    private boolean relayFinal = false;
+    private long relayToggleTime;
+    private long relayLastSend;
+    private float relayX;
+    private float relayY;
+    private float latestX;
+    private float latestY;
+    private GestureDescription.StrokeDescription relayStroke;
+    private final Runnable relayWatch = this::relayEnd;
+
+    private final GestureResultCallback relayCb = new GestureResultCallback() {
+        @Override
+        public void onCompleted(GestureDescription d) {
+            relayBusy = false;
+            if (relayFinal) {
+                relayEnd();
+            } else {
+                relayPump();
+            }
+        }
+
+        @Override
+        public void onCancelled(GestureDescription d) {
+            relayEnd();
+        }
+    };
+
+    private void startRelay(float ox, float oy) {
+        relayStarted = true;
+        relayUp = false;
+        relayFinal = false;
+        relayBusy = true;
+        relayToggleTime = SystemClock.uptimeMillis();
+        relayLastSend = relayToggleTime;
+        setCapture(false);
+        try {
+            Path p = new Path();
+            p.moveTo(ox, oy);
+            p.lineTo(latestX, latestY);
+            relayStroke = new GestureDescription.StrokeDescription(p, 0, 40, true);
+            relayX = latestX;
+            relayY = latestY;
+            handler.removeCallbacks(relayWatch);
+            handler.postDelayed(relayWatch, 2000);
+            boolean ok = dispatchGesture(
+                    new GestureDescription.Builder().addStroke(relayStroke).build(), relayCb, handler);
+            if (!ok) relayEnd();
+        } catch (Exception ex) {
+            relayEnd();
+        }
+    }
+
+    private void relayPump() {
+        if (!relayStarted || relayBusy || relayFinal) return;
+        boolean fin = relayUp;
+        if (!fin && Math.hypot(latestX - relayX, latestY - relayY) < 3) return;
+        long now = SystemClock.uptimeMillis();
+        long dur = Math.max(16, Math.min(now - relayLastSend, 120));
+        relayLastSend = now;
+        try {
+            Path p = new Path();
+            p.moveTo(relayX, relayY);
+            p.lineTo(latestX, latestY);
+            relayStroke = relayStroke.continueStroke(p, 0, dur, !fin);
+            relayX = latestX;
+            relayY = latestY;
+            relayBusy = true;
+            relayFinal = fin;
+            handler.removeCallbacks(relayWatch);
+            handler.postDelayed(relayWatch, 2000);
+            boolean ok = dispatchGesture(
+                    new GestureDescription.Builder().addStroke(relayStroke).build(), relayCb, handler);
+            if (!ok) relayEnd();
+        } catch (Exception ex) {
+            relayEnd();
+        }
+    }
+
+    private void relayEnd() {
+        handler.removeCallbacks(relayWatch);
+        relayStarted = false;
+        relayBusy = false;
+        relayFinal = false;
+        relayUp = false;
+        relayStroke = null;
+        if (recording && captureOn()) setCapture(true);
     }
 
     private void thin(Gesture g) {
