@@ -117,13 +117,7 @@ public class RecService extends AccessibilityService {
         wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
         android.content.SharedPreferences sp = getSharedPreferences("taprec", MODE_PRIVATE);
         mode = 3;
-        captureInfo = "系统低于 Android 12，使用精确录制（有延迟）";
-        if (Build.VERSION.SDK_INT >= 31 && startTouchCapture()) {
-            mode = 0;
-            captureInfo = "全屏触摸捕获已启用（无延迟）";
-        } else if (Build.VERSION.SDK_INT >= 31) {
-            captureInfo = "触摸捕获不可用，已改用精确录制（有延迟）。请把无障碍里的 TapRec 关掉再打开试试";
-        }
+        captureInfo = "全屏精确录制（点击几乎没有延迟）";
         if (captureView == null) createCapture();
         showPanel();
     }
@@ -593,7 +587,6 @@ public class RecService extends AccessibilityService {
     }
 
     private String modeText() {
-        if (mode == 3) return "模式：精确";
         return "模式：全屏";
     }
 
@@ -714,7 +707,8 @@ public class RecService extends AccessibilityService {
                     for (float[] q : g.pts) {
                         if (Math.hypot(q[0] - p0[0], q[1] - p0[1]) > 24) moved = true;
                     }
-                    g.dur = moved ? Math.min(held, 400) : Math.min(held, 1200);
+                    boolean tap = !moved && held < 350;
+                    g.dur = moved ? Math.min(held, 300) : (tap ? 60 : Math.min(held, 1200));
                     lastEnd = e.getEventTime();
                     lastPreciseTime = SystemClock.uptimeMillis();
                     lastPreciseX = x;
@@ -723,7 +717,7 @@ public class RecService extends AccessibilityService {
                     thin(g);
                     current.add(g);
                     setStatus("录制中：" + current.size() + " 个动作");
-                    passThrough(g);
+                    passThrough(g, tap);
                 }
                 break;
             case MotionEvent.ACTION_CANCEL:
@@ -747,9 +741,15 @@ public class RecService extends AccessibilityService {
     }
 
     // 手指抬起后，把这次操作原样"转发"给下面的应用
-    private void passThrough(Gesture g) {
+    private void passThrough(Gesture g, boolean tap) {
+        Gesture inj = g;
+        if (tap) {
+            inj = new Gesture();
+            inj.dur = 8;
+            inj.pts.add(g.pts.get(0));
+        }
         setCapture(false);
-        dispatch(g, () -> {
+        dispatch(inj, () -> {
             if (recording && captureOn()) setCapture(true);
         });
     }
